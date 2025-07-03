@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Meat Supply-Chain Simulation</title>
+  <style>
+    body { margin:0; overflow:hidden; background:#eef; }
+
+    /* ─────── Overlay panels ─────── */
+    #logOverlay, #helpOverlay{
+      position:absolute; top:-100%; left:0;
+      width:100%; height:100%;
+      background:rgba(0,0,0,0.5); color:#fff;
+      overflow-y:auto; font-family:monospace;
+      padding:20px; box-sizing:border-box;
+      transition:top .5s ease;
+      touch-action:pan-y;
+      pointer-events:none;          /* enabled only while visible */
+    }
+    #logOverlay table{ width:100%; border-collapse:collapse; }
+    #logOverlay th, #logOverlay td{
+      border:1px solid #ccc; padding:4px; text-align:center;
+    }
+    #logOverlay th{
+      background:rgba(80,80,80,0.9);
+      position:sticky; top:0; z-index:1;
+    }
+    #helpOverlay h1{ margin-top:0; }
+    #helpOverlay h2{ margin:1em 0 .5em; color:#ffd700; }
+    #helpOverlay ul{ list-style:disc; padding-left:20px; }
+  </style>
+</head>
+<body>
+  <!-- overlay panels -->
+  <div id="logOverlay"></div>
+
+  <div id="helpOverlay">
+    <h1>Meat Supply-Chain Simulation</h1>
+    <p>
+      This simulator visualises the pork supply chain—raising pigs, processing them at
+      factories, shipping to stores and warehouses, and finally selling to customers—
+      while tracking cost and revenue in real time.
+    </p>
+
+    <h2>How to Operate</h2>
+    <ul>
+      <li><strong>Tap (single):</strong> show / hide the sales log</li>
+      <li><strong>Double-tap:</strong> show / hide this help screen</li>
+    </ul>
+
+    <h2>Time &amp; Cycle Settings</h2>
+    <ul>
+      <li><strong>Normal / Peak switch:</strong> every&nbsp;40 s / 20 s</li>
+      <li><strong>Pig spawn interval:</strong> Normal&nbsp;2000 ms (±10 %) / Peak&nbsp;1500 ms (±10 %)</li>
+      <li><strong>Customer spawn interval:</strong> Normal&nbsp;3 s (±10 %) / Peak&nbsp;1 s (±10 %)</li>
+      <li><strong>Truck speed:</strong> 0.2 unit / frame</li>
+      <li><strong>Walking speed:</strong> ≈0.6 unit / frame</li>
+    </ul>
+
+    <h2>Inventory &amp; Shipping</h2>
+    <ul>
+      <li><strong>Initial store inventory:</strong> 64 items / store (8 × 8)</li>
+      <li><strong>Initial warehouse inventory:</strong> 0 items</li>
+      <li><strong>Products per pig:</strong> 12</li>
+      <li><strong>Truck capacity:</strong> Normal 32 / Peak 16</li>
+      <li><strong>Factory shipping rules:</strong>
+        <ul>
+          <li>If facing store’s <em>effective inventory</em> &lt; 64 → ship to facing store</li>
+          <li>Else if middle store’s effective inventory ≤ ⅔ of facing store → ship to warehouse; otherwise ship to facing store</li>
+        </ul>
+      </li>
+      <li><strong>Warehouse shipping rule:</strong>
+        ship when effective inventory &lt; 64 and a truck to that store has passed halfway</li>
+      <li><strong>FIFO management:</strong> oldest stock first (warehouse &amp; store)</li>
+    </ul>
+
+    <h2>Cost &amp; Profit</h2>
+    <ul>
+      <li><strong>Raw material:</strong> 120 / pig (10 / product)</li>
+      <li><strong>Manufacturing:</strong> Normal 10 / Peak 12</li>
+      <li><strong>Delivery:</strong>
+        <ul>
+          <li>Factory → Store: 160 / truck</li>
+          <li>Factory → Warehouse: 120 / truck</li>
+          <li>Warehouse → Store: 80 / truck</li>
+          <li>Unit cost = cost ÷ load size</li>
+        </ul>
+      </li>
+      <li><strong>Holding:</strong> Warehouse 0.1 / s, Store 0.2 / s</li>
+      <li><strong>Selling price:</strong> Normal 50 / Peak 40</li>
+    </ul>
+  </div>
+
+  <!-- Three.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+  <script>
+/* ─────────── GLOBALS & SCENE ─────────── */
+let transactionLog = [];
+
+let logVisible   = false;
+let helpVisible  = false;
+let logUpdateInterval = null;
+
+const clock    = new THREE.Clock();
+const scene    = new THREE.Scene();
+const camera   = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, .1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+camera.position.set(0,20,40);
+camera.lookAt(0,0,-20);
+
+/* directional light (fixed buggy one-liner) */
+const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+dirLight.position.set(0, 200, 100);
+scene.add(dirLight);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(300,300),
+  new THREE.MeshLambertMaterial({ color:0x666666 })
+);
+ground.rotation.x = -Math.PI/2;
+scene.add(ground);
+
+/* ─────────── PEAK-SEASON MANAGEMENT ─────────── */
+let busy = false;
+let customerInterval = 3.0;
+const normalDur = 40, busyDur = 20;
+const storeRoofs = [], factoryMeshes = [];
+
+function cycleStore(){
+  busy = !busy;
+  customerInterval = busy ? 1.0 : 3.0;
+  storeRoofs.forEach(r => r.material.color.set(busy?0xff69b4:0xffffff));
+  setTimeout(cycleStore, (busy?busyDur:normalDur)*1000);
+}
+setTimeout(cycleStore, normalDur*1000);
+
+function cycleFactory(){
+  factoryMeshes.forEach(m => m.material.color.set(busy?0xff69b4:0xffffff));
+  setTimeout(cycleFactory, (busy?busyDur:normalDur)*1000);
+}
+setTimeout(cycleFactory, normalDur*1000);
+
+/* ─────────── TIMERS ─────────── */
+let nextCustomerTime=[0,0,0];
+let nextTruckTime   =[0,0];
+
+/* ─────────── GEOMETRY HELPERS ─────────── */
+function box(w,h,d,c,x,y,z){
+  const m=new THREE.Mesh(
+    new THREE.BoxGeometry(w,h,d),
+    new THREE.MeshLambertMaterial({ color:c })
+  );
+  m.position.set(x,y,z);
+  return m;
+}
+function cyl(r,h,c,x,y,z,rx=Math.PI/2){
+  const m=new THREE.Mesh(
+    new THREE.CylinderGeometry(r,r,h,32),
+    new THREE.MeshLambertMaterial({ color:c })
+  );
+  m.position.set(x,y,z);
+  m.rotation.set(rx,0,0);
+  return m;
+}
+
+/* ─────────── PIG MODEL & TAG ─────────── */
+function pigModel(){
+  const g=new THREE.Group();
+  const body=new THREE.Mesh(
+    new THREE.SphereGeometry(1,32,32),
+    new THREE.MeshLambertMaterial({ color:0xffc0cb })
+  );
+  body.scale.set(1.4,1,2); g.add(body);
+
+  const legG=new THREE.CylinderGeometry(0.2,0.2,0.4,16);
+  const legM=new THREE.MeshLambertMaterial({ color:0xffa0a0 });
+  [[-0.6,-0.7,-1.2],[0.6,-0.7,-1.2],[-0.6,-0.7,1.2],[0.6,-0.7,1.2]]
+    .forEach(p=>{const l=new THREE.Mesh(legG,legM); l.position.set(...p); g.add(l);});
+
+  const earG=new THREE.ConeGeometry(0.2,0.5,8);
+  const earM=new THREE.MeshLambertMaterial({ color:0xffa0a0 });
+  function ear(x,y,z){
+    const e=new THREE.Mesh(earG,earM); e.position.set(x,y,z);
+    e.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), new THREE.Vector3(x,y,z).normalize());
+    return e;
+  }
+  g.add(ear(-.55,.7,-1.2), ear(.55,.7,-1.2));
+
+  const eyeG=new THREE.SphereGeometry(0.1,8,8);
+  const eyeM=new THREE.MeshLambertMaterial({ color:0x000000 });
+  const eyeL=new THREE.Mesh(eyeG,eyeM); eyeL.position.set(-.25,.4,-1.7);
+  const eyeR=eyeL.clone(); eyeR.position.x*=-1; g.add(eyeL,eyeR);
+
+  const nose=new THREE.Mesh(
+    new THREE.CylinderGeometry(0.3,0.3,0.2,16),
+    new THREE.MeshLambertMaterial({ color:0xff9999 })
+  );
+  nose.rotation.x=Math.PI/2; nose.position.set(0,.1,-1.95); g.add(nose);
+
+  const tail=new THREE.Mesh(
+    new THREE.TorusGeometry(0.15,0.04,8,16,Math.PI*1.5),
+    new THREE.MeshLambertMaterial({ color:0xffa0a0 })
+  );
+  tail.rotation.set(Math.PI/2,0,0); tail.position.set(0,.2,2.1); g.add(tail);
+
+  g.rotation.y=-Math.PI/2;
+  return g;
+}
+function tagMesh(fi){
+  const col=fi===0?0xADD8E6:0x90EE90;
+  const tag=new THREE.Mesh(
+    new THREE.BoxGeometry(5/3,3/3,0.2/3),
+    new THREE.MeshLambertMaterial({ color:col })
+  );
+  tag.position.set(0,2,0);
+  tag.rotation.set(0,Math.PI/2,Math.PI/2);
+  return tag;
+}
+
+/* ─────────── INVENTORY LAYOUT HELPERS ─────────── */
+function reorder(inv){
+  inv.forEach((c,i)=>{
+    const layer=Math.floor(i/64), idx=i%64, row=Math.floor(idx/8), col=idx%8;
+    c.position.set(col*.7-7*.7/2, 0.05+layer*0.6, row*.7-7*.7/2);
+    c.rotation.set(0,0,0);
+  });
+}
+function reorderCube(inv){
+  const cC=2, rC=2, sp=0.7, vs=0.6;
+  inv.forEach((c,i)=>{
+    const layer=Math.floor(i/(cC*rC)), idx=i%(cC*rC),
+          row=Math.floor(idx/cC), col=idx%cC, off=(cC-1)*sp/2;
+    c.position.set(col*sp-off, 0.05+layer*vs, row*sp-off);
+    c.rotation.set(0,0,0);
+  });
+}
+
+/* ─────────── FACILITIES ─────────── */
+const factories=[{x:-30,z:0},{x:-30,z:-60}];
+const stores   =[ {x:30,z:0},{x:30,z:-30},{x:30,z:-60} ];
+const freezer  ={x:0,z:-30};
+const storeB   =[];
+
+factories.forEach(f=>{
+  const m=box(6,6,6,0xffffff,f.x,3,f.z);
+  scene.add(m); factoryMeshes.push(m);
+});
+stores.forEach(s=>{
+  const b=box(6,4.2,6,0xffffff,s.x,2.1,s.z);
+  b.material.transparent=true; b.material.opacity=0.2;
+  scene.add(b); storeB.push(b);
+
+  const roof=new THREE.Mesh(
+    new THREE.ConeGeometry(6/Math.sqrt(2),1.8,4),
+    new THREE.MeshLambertMaterial({ color:0xffffff,transparent:true,opacity:0.5 })
+  );
+  roof.position.set(s.x,5.1,s.z); roof.rotation.y=Math.PI/4;
+  scene.add(roof); storeRoofs.push(roof);
+});
+const warehouse=box(6,6,6,0xffffff,freezer.x,3,freezer.z);
+warehouse.material.transparent=true; warehouse.material.opacity=0.2;
+scene.add(warehouse);
+
+/* ─────────── INVENTORY CONTAINERS ─────────── */
+const storeInv=[[],[],[]];
+function initStore(){
+  storeB.forEach((b,si)=>{
+    for(let i=0;i<64;i++){
+      const c=box(0.5,0.5,0.5,0xffffff,0,0,0);
+      c.userData={
+        initial:true,
+        costs:{ raw:10, manufacturing:10, delivery:5, warehouse:0, store:0 },
+        timeStoreEntry:0
+      };
+      b.attach(c); storeInv[si].push(c);
+      const row=Math.floor(i/8), col=i%8;
+      c.position.set(col*.7-7*.7/2,0.05,row*.7-7*.7/2);
+    }
+  });
+}
+initStore();
+let warehouseInv=[];
+let pending=[0,0,0];
+
+/* ─────────── TRUCKS & SHIPPING ─────────── */
+let activeTrucks=[null,null];  // one per factory
+let trucks       =[];          // moving trucks
+let queue        =[[],[]];     // product queues per factory
+
+function assignCosts(p,fi){
+  p.costs={
+    raw:10,
+    manufacturing:busy?12:10,
+    delivery:0,
+    warehouse:0,
+    store:0
+  };
+  p.factoryIndex=fi;
+}
+
+function createTruck(fi){
+  const g=new THREE.Group();
+
+  const boxMesh=box(6.4,3,2.4,0xffffff,0,0,0);
+  boxMesh.material.transparent=true; boxMesh.material.opacity=0.2;
+  g.add(boxMesh);
+
+  const cab=box(1.6,2,2.4,0xffffff,4,-.5,0);
+  cab.userData.isCabin=true; g.add(cab);
+
+  [[4,-1.5,-1.2],[4,-1.5,1.2],[-.8,-1.5,-1.2],[-.8,-1.5,1.2]]
+    .forEach(p=>g.add(cyl(0.6,0.4,0x000000,...p)));
+
+  g.position.set(factories[fi].x+5,2.1,factories[fi].z);
+  g.userData={
+    cargoCount:0,
+    phase:'loading',
+    factoryIndex:fi,
+    route:null,
+    targetStoreIndex:null,
+    targetRotationY:null
+  };
+
+  scene.add(g); activeTrucks[fi]=g;
+}
+
+function spawnAnimal(fi){
+  if((!activeTrucks[fi] || activeTrucks[fi].userData.phase!=='loading') &&
+     Date.now()>=nextTruckTime[fi]) createTruck(fi);
+
+  const pig=pigModel();
+  pig.position.set(factories[fi].x-15,1,factories[fi].z);
+  pig.add(tagMesh(fi)); scene.add(pig);
+
+  const id=setInterval(()=>{
+    pig.position.x+=0.6;
+    if(pig.position.x>=factories[fi].x-3){
+      clearInterval(id); scene.remove(pig);
+      for(let i=0;i<12;i++){
+        const prod={ color:fi===0?0xADD8E6:0x90EE90 };
+        assignCosts(prod,fi);
+        queue[fi].push(prod);
+      }
+      startLoading(fi);
+    }
+  },40);
+}
+
+function startLoading(fi){
+  const tr=activeTrucks[fi];
+  if(!tr||tr.userData.phase!=='loading') return;
+
+  while(queue[fi].length>0 && tr.userData.cargoCount<(busy?16:32)){
+    const item=queue[fi].shift();
+    const bm=box(0.5,0.5,0.5,item.color,0,0,0);
+    bm.userData={...item,isCargo:true};
+    tr.attach(bm);
+    const idx=tr.userData.cargoCount++;
+    const x=2.45-(idx%8)*0.7,
+          z=(Math.floor(idx/8)%2===0?-0.6:0.6),
+          y=(idx<16?-0.6:0.2);
+    bm.position.set(x,y,z);
+  }
+
+  if(tr.userData.cargoCount<(busy?16:32)) return;
+
+  /* decide route */
+  const front=fi===0?0:2;
+  const effF =storeInv[front].length+inTransit(front);
+
+  if(effF<64){
+    tr.userData.route='store';
+    tr.userData.targetStoreIndex=front;
+  }else{
+    const effM=storeInv[1].length+inTransit(1);
+    if(effM<=2/3*effF){
+      tr.userData.route='freezer';
+    }else{
+      tr.userData.route='store';
+      tr.userData.targetStoreIndex=front;
+    }
+  }
+
+  /* apply delivery cost */
+  const unitCost=(tr.userData.route==='freezer'?120:160)/tr.userData.cargoCount;
+  tr.children.forEach(c=>{ if(c.userData.isCargo) c.userData.costs.delivery+=unitCost; });
+
+  activeTrucks[fi]=null; nextTruckTime[fi]=Date.now()+500;
+
+  const cabMesh=tr.children.find(c=>c.userData.isCabin);
+  cabMesh.material.color.set(tr.userData.cargoCount<32?0xff69b4:0xffffff);
+
+  if(tr.userData.route==='freezer'){
+    const dx=freezer.x-tr.position.x, dz=freezer.z-tr.position.z;
+    tr.userData.targetRotationY=-Math.atan2(dz,dx);
+    tr.userData.phase='rotating';
+  }else{
+    tr.userData.phase='moving';
+  }
+
+  if(tr.userData.route==='store')
+    pending[tr.userData.targetStoreIndex]+=tr.userData.cargoCount;
+
+  trucks.push(tr);
+}
+
+function inTransit(si){
+  return trucks.reduce((s,t)=> s+(
+    t.userData.route==='shipment' && t.userData.targetStoreIndex===si
+      ? t.userData.cargoCount : 0
+  ),0);
+}
+
+function unloadTruck(tr){
+  const t=clock.getElapsedTime();
+  tr.children.filter(c=>c.userData.isCargo).forEach(c=>{
+    warehouse.attach(c); warehouseInv.push(c);
+    c.userData.timeWarehouseEntry=t;
+  });
+  reorder(warehouseInv);
+}
+
+function deliver(tr){
+  const t=clock.getElapsedTime();
+  const si=tr.userData.targetStoreIndex;
+  const inv=storeInv[si];
+  tr.children.filter(c=>c.userData.isCargo).forEach(c=>{
+    tr.remove(c); storeB[si].attach(c); inv.push(c);
+    if(c.userData.timeWarehouseEntry!==undefined)
+      c.userData.costs.warehouse+=(t-c.userData.timeWarehouseEntry)*0.1;
+    c.userData.timeStoreEntry=t;
+  });
+  reorder(inv);
+  pending[si]=Math.max(0,pending[si]-tr.userData.cargoCount);
+}
+
+function dispatchWarehouseShipment(){
+  let target=null, minEff=Infinity;
+  storeInv.forEach((inv,i)=>{
+    const eff=inv.length+inTransit(i)+pending[i];
+    if(eff<64 && eff<minEff){ minEff=eff; target=i; }
+  });
+  if(target===null || warehouseInv.length===0) return;
+
+  const cap=busy?16:32;
+  const cnt=Math.min(cap, warehouseInv.length);
+
+  const ongoing=trucks.find(t=>t.userData.route==='shipment' && t.userData.targetStoreIndex===target);
+  if(ongoing){
+    const total=warehouse.position.distanceTo(storeB[target].position);
+    const cur  =ongoing.position.distanceTo(warehouse.position);
+    if(cur<total/2) return;
+  }
+
+  const tr=new THREE.Group();
+  const b=box(6.4,3,2.4,0xcccccc,0,0,0);
+  b.material.transparent=true; b.material.opacity=0.2; tr.add(b);
+  const cab=box(1.6,2,2.4,0xffffff,4,-.5,0); cab.userData.isCabin=true; tr.add(cab);
+  [[4,-1.5,-1.2],[4,-1.5,1.2],[-.8,-1.5,-1.2],[-.8,-1.5,1.2]]
+    .forEach(p=>tr.add(cyl(0.6,0.4,0x000000,...p)));
+
+  tr.position.copy(warehouse.position);
+
+  const dx=stores[target].x-tr.position.x,
+        dz=stores[target].z-tr.position.z;
+  tr.userData={
+    cargoCount:0,
+    phase:'rotating',
+    route:'shipment',
+    targetStoreIndex:target,
+    targetRotationY:-Math.atan2(dz,dx)
+  };
+
+  for(let i=0;i<cnt;i++){
+    const c=warehouseInv.shift();
+    warehouse.remove(c); tr.attach(c);
+    c.userData.shipped=true;
+    tr.userData.cargoCount++;
+    c.userData.costs.delivery+=80/cnt;
+    const xx=2.45-(i%8)*0.7,
+          zz=(Math.floor(i/8)%2===0?-0.6:0.6),
+          yy=(i<16?-0.6:0.2);
+    c.position.set(xx,yy,zz);
+  }
+
+  cab.material.color.set(tr.userData.cargoCount<32?0xff69b4:0xffffff);
+  pending[target]+=tr.userData.cargoCount;
+  trucks.push(tr); scene.add(tr);
+}
+
+/* ─────────── CUSTOMERS & SALES LOG ─────────── */
+let customers=[];
+
+function createCustomer(){
+  const g=new THREE.Group();
+  const m=new THREE.MeshLambertMaterial({ color:0xffffff });
+
+  const head=new THREE.Mesh(new THREE.SphereGeometry(0.21,16,16),m);
+  head.position.set(0,2.5,0); g.add(head);
+
+  const torso=new THREE.Mesh(new THREE.BoxGeometry(0.6,1,0.3),m);
+  torso.position.set(0,1.75,0); g.add(torso);
+
+  function arm(){
+    const geo=new THREE.CylinderGeometry(0.1,0.1,0.7,16);
+    geo.translate(0,-0.35,0);
+    return new THREE.Mesh(geo,m);
+  }
+  const la=new THREE.Group(); la.position.set(-.35,2,0); la.add(arm()); g.add(la);
+  const ra=new THREE.Group(); ra.position.set( .35,2,0); ra.add(arm()); g.add(ra);
+
+  function leg(){
+    const geo=new THREE.BoxGeometry(0.25,1,0.25);
+    geo.translate(0,-0.5,0);
+    return new THREE.Mesh(geo,m);
+  }
+  const ll=new THREE.Group(); ll.position.set(-.15,1,0); ll.add(leg()); g.add(ll);
+  const rl=new THREE.Group(); rl.position.set( .15,1,0); rl.add(leg()); g.add(rl);
+
+  g.rotation.y=Math.PI/2;
+  return g;
+}
+
+function animateMove(o,s,e,d,cb){
+  const steps=d/50;
+  const delta=new THREE.Vector3().subVectors(e,s).divideScalar(steps);
+  let i=0; o.position.copy(s);
+  const id=setInterval(()=>{
+    if(++i>=steps){ clearInterval(id); cb&&cb(); }
+    o.position.add(delta);
+  },50);
+}
+
+function spawnCustomer(si){
+  const now=clock.getElapsedTime();
+  if(now<nextCustomerTime[si]) return;
+
+  const store=storeB[si];
+  const rz=(Math.random()-0.5)*2;
+  const start=store.position.clone().add(new THREE.Vector3(10,0,rz));
+  const mid  =store.position.clone().add(new THREE.Vector3( 1,0,rz));
+
+  const c=createCustomer();
+  c.position.copy(start); customers.push(c); scene.add(c);
+
+  animateMove(c,start,mid,750,()=>{
+    const inv=storeInv[si];
+    const t  =clock.getElapsedTime();
+
+    if(inv.length>=8){
+      const grp=new THREE.Group();
+      const season=busy?'Peak':'Normal';
+      const price =busy?40   :50;
+
+      for(let j=0;j<8;j++){
+        const p=inv.shift(); storeB[si].remove(p); grp.add(p);
+        if(p.userData.timeWarehouseEntry!==undefined)
+          p.userData.costs.warehouse+=(t-p.userData.timeWarehouseEntry)*0.1;
+      }
+      reorderCube(grp.children);
+      grp.position.set(0,1,1); c.add(grp);
+
+      grp.children.forEach(prod=>{
+        if(prod.userData.timeStoreEntry!==undefined)
+          prod.userData.costs.store+=(t-prod.userData.timeStoreEntry)*0.2;
+
+        let fn=prod.userData.factoryIndex;
+        if(fn===undefined)
+          fn = prod.material.color.getHex()===0xADD8E6?0:1;
+
+        transactionLog.push({
+          saleTime      :t.toFixed(2),
+          season        :season,
+          storeNumber   :si,
+          factoryNumber :fn,
+          raw           :prod.userData.costs.raw.toFixed(2),
+          manufacturing :prod.userData.costs.manufacturing.toFixed(2),
+          delivery      :prod.userData.costs.delivery.toFixed(2),
+          warehouse     :prod.userData.costs.warehouse.toFixed(2),
+          store         :prod.userData.costs.store.toFixed(2),
+          salePrice     :price,
+          profit        :(price - (prod.userData.costs.raw +
+                                   prod.userData.costs.manufacturing +
+                                   prod.userData.costs.delivery +
+                                   prod.userData.costs.warehouse +
+                                   prod.userData.costs.store)).toFixed(2)
+        });
+      });
+    }else{
+      c.traverse(n=>n.isMesh && n.material.color.set(0xff0000)); // out-of-stock mark
+    }
+
+    animateMove(c,mid,start,750,()=>{
+      scene.remove(c);
+      customers.splice(customers.indexOf(c),1);
+    });
+  });
+
+  nextCustomerTime[si]=now + customerInterval*(Math.random()*0.2+0.9);
+}
+
+function updateCustomers(){ [0,1,2].forEach(i=>spawnCustomer(i)); }
+
+/* ─────────── MAIN LOOP ─────────── */
+function updateChain(){
+  /* truck FSM */
+  for(let i=trucks.length-1;i>=0;i--){
+    const tr=trucks[i];
+
+    if(tr.userData.phase==='rotating'){
+      let diff=(tr.userData.targetRotationY-tr.rotation.y+2*Math.PI)%(2*Math.PI);
+      if(diff>Math.PI) diff-=2*Math.PI;
+      if(Math.abs(diff)>0.01)
+        tr.rotation.y += diff<0 ? -Math.min(0.05,Math.abs(diff)) : Math.min(0.05,diff);
+      else{
+        tr.rotation.y=tr.userData.targetRotationY;
+        tr.userData.phase='moving';
+      }
+    }else if(tr.userData.phase==='moving'){
+      const tgt = tr.userData.route==='freezer' ? freezer : stores[tr.userData.targetStoreIndex];
+      const dx=tgt.x-tr.position.x, dz=tgt.z-tr.position.z;
+      const dist=Math.hypot(dx,dz), speed=0.2;
+      tr.position.x += (dx/dist)*speed;
+      tr.position.z += (dz/dist)*speed;
+      if(dist<8){
+        tr.userData.route==='freezer' ? unloadTruck(tr) : deliver(tr);
+        scene.remove(tr); trucks.splice(i,1);
+      }
+    }
+  }
+
+  /* factory loading checker */
+  [0,1].forEach(fi=>{
+    if(queue[fi].length>0 && !activeTrucks[fi] && Date.now()>=nextTruckTime[fi]){
+      createTruck(fi); startLoading(fi);
+    }
+  });
+
+  dispatchWarehouseShipment();
+}
+
+function animate(){
+  updateChain();
+  updateCustomers();
+  renderer.render(scene,camera);
+  requestAnimationFrame(animate);
+}
+window.addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+/* pig spawn loop */
+function spawnPigs(){
+  spawnAnimal(0); spawnAnimal(1);
+  const base=busy?1500:2000;
+  setTimeout(spawnPigs, base*(Math.random()*0.2+0.9));
+}
+spawnPigs();
+
+/* ─────────── OVERLAYS ─────────── */
+const logEl = document.getElementById('logOverlay');
+const helpEl= document.getElementById('helpOverlay');
+
+function updateLog(){
+  let html='<table><thead><tr>'+
+           '<th>Sale&nbsp;Time&nbsp;(s)</th><th>Season</th><th>Store&nbsp;#</th>'+
+           '<th>Factory&nbsp;#</th><th>Raw</th><th>Mfg</th>'+
+           '<th>Delivery</th><th>Warehouse</th><th>Store</th>'+
+           '<th>Sales</th><th>Profit</th>'+
+           '</tr></thead><tbody>';
+  transactionLog.forEach(e=>{
+    html+=`<tr><td>${e.saleTime}</td><td>${e.season}</td>`+
+          `<td>${e.storeNumber}</td><td>${e.factoryNumber}</td>`+
+          `<td>${e.raw}</td><td>${e.manufacturing}</td>`+
+          `<td>${e.delivery}</td><td>${e.warehouse}</td>`+
+          `<td>${e.store}</td><td>${e.salePrice}</td><td>${e.profit}</td></tr>`;
+  });
+  html+='</tbody></table>'; logEl.innerHTML=html;
+}
+
+/* tap → log */
+document.addEventListener('click',()=>{
+  if (helpVisible) return;
+  logVisible=!logVisible;
+  if(logVisible){
+    logEl.style.top='0';
+    logEl.style.pointerEvents='auto';
+    updateLog();
+    logUpdateInterval=setInterval(updateLog,500);
+  }else{
+    logEl.style.top='-100%';
+    logEl.style.pointerEvents='none';
+    clearInterval(logUpdateInterval);
+  }
+});
+
+/* double-tap → help (and hide log) */
+document.addEventListener('dblclick',()=>{
+  helpVisible=!helpVisible;
+  if(helpVisible){
+    helpEl.style.top='0';
+    helpEl.style.pointerEvents='auto';
+    logVisible=false;
+    logEl.style.top='-100%';
+    logEl.style.pointerEvents='none';
+    clearInterval(logUpdateInterval);
+  }else{
+    helpEl.style.top='-100%';
+    helpEl.style.pointerEvents='none';
+  }
+});
+
+/* start */
+animate();
+  </script>
+</body>
+</html>
